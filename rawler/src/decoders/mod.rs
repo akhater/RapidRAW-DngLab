@@ -1145,3 +1145,19 @@ where
   });
   out
 }
+
+#[cfg(test)]
+mod camera_catalog_tests {
+  use super::RawLoader;
+
+  #[test]
+  fn canon_eos_c50_raw_modes_are_registered() {
+    let loader = RawLoader::new();
+
+    for mode in ["raw", "craw"] {
+      let key = ("Canon".to_string(), "Canon EOS C50".to_string(), mode.to_string());
+      let camera = loader.get_cameras().get(&key).expect("C50 mode should be registered");
+      assert_eq!(camera.clean_model, "EOS C50");
+    }
+  }
+}
