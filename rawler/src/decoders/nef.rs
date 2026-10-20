@@ -204,9 +204,9 @@ impl<'a> Decoder for NefDecoder<'a> {
     };
     debug!("TIFF compression flag: {}, NEF compression mode: {:?}", compression, nef_compression);
 
-    if matches!(nef_compression, Some(NefCompression::HighEfficency)) || matches!(nef_compression, Some(NefCompression::HighEfficencyStar)) {
-      return Err(RawlerError::DecoderFailed(format!("NEF compression {:?} is not supported", nef_compression)));
-    }
+    // High Efficiency and High Efficiency* are a JPEG XS codestream (TicoRAW).
+    // Known by the maker note, or by the codestream's SOC and CAP markers on any body.
+    let high_efficiency = matches!(nef_compression, Some(NefCompression::HighEfficency | NefCompression::HighEfficencyStar));
 
     let offset = fetch_tiff_tag!(raw, TiffCommonTag::StripOffsets).force_usize(0);
     let size = fetch_tiff_tag!(raw, TiffCommonTag::StripByteCounts).force_usize(0);
@@ -233,7 +233,17 @@ impl<'a> Decoder for NefDecoder<'a> {
 
     assert_eq!(self.tiff.little_endian(), self.makernote.endian == Endian::Little);
 
-    let image = if self.camera.model == "NIKON D100" {
+    let high_efficiency = high_efficiency || src.get(..4) == Some(&[0xff, 0x10, 0xff, 0x50][..]);
+    let image = if high_efficiency {
+      if dummy {
+        PixU16::new_uninit(width, height)
+      } else {
+        let mut image = PixU16::new(width, height);
+        crate::decompressors::nikon_he::decode(&src, image.pixels_mut(), width, height, width)
+          .map_err(|e| RawlerError::DecoderFailed(format!("NEF High Efficiency: {e}")))?;
+        image
+      }
+    } else if self.camera.model == "NIKON D100" {
       width = 3040;
       decode_12be_wcontrol(&src, width, height, dummy)
     } else if self.camera.find_hint("coolpixsplit") {
