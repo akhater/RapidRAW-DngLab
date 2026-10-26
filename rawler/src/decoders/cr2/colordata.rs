@@ -130,8 +130,10 @@ pub(crate) fn parse_colordata(colordata: &Entry) -> Result<ColorData> {
         34 => ColorData::new(data, version, 0x69, Some(0x16b), Some(0x280), Some(0x281)),
         // 48 (R7/R10)
         48 => ColorData::new(data, version, 0x69, Some(0x16b), Some(0x281), Some(0x282)),
-        // 64 (R5MK2), 65 (R50V), 66 (R6MK3)
-        64 | 65 | 66 => ColorData::new(data, version, 0x69, Some(0x17f), Some(0x294), Some(0x295)),
+        // 64 (R5MK2), 65 (R50V), 66 (R6MK3), 67 (R8MK2)
+        // 67: as shot at 0x69 as in 64, levels at 0x17f and 0x294/0x295 as in 64 to 66
+        // (RAWmakase 3c54413, measured against Adobe DNG Converter 18.7).
+        64 | 65 | 66 | 67 => ColorData::new(data, version, 0x69, Some(0x17f), Some(0x294), Some(0x295)),
 
         _ => return Err(format!("Unknown COLORDATA version: {}", data[0]).into()),
       })
@@ -141,5 +143,34 @@ pub(crate) fn parse_colordata(colordata: &Entry) -> Result<ColorData> {
       "Invalid COLORDATA tag: type {}",
       colordata.value_type_name()
     ))),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The EOS R8 Mark II's ColorData version 67, from one of its files at ISO
+  /// 25600 (RAWmakase 3c54413, its test reads_color_data_version_67): as shot at
+  /// word 105, black at 383, normal and specular white at 660 and 661.
+  #[test]
+  fn reads_color_data_version_67() {
+    let mut cd = vec![0u16; 1312];
+    cd[0] = 67;
+    cd[105..110].copy_from_slice(&[1649, 1024, 1024, 1817, 4103]);
+    cd[110..115].copy_from_slice(&[1931, 1024, 1024, 1533, 5200]);
+    cd[383..387].copy_from_slice(&[2047, 2048, 2048, 2048]);
+    cd[660..662].copy_from_slice(&[13535, 14888]);
+    let entry = Entry {
+      tag: 0x4001,
+      value: Value::Short(cd),
+      embedded: None,
+    };
+    let data = parse_colordata(&entry).unwrap();
+    assert_eq!(data.version, 67);
+    assert_eq!(data.wb, [1649., 1024., 1024., 1817.]);
+    assert_eq!(data.blacklevel, Some([2047, 2048, 2048, 2048]));
+    assert_eq!(data.normal_whitelevel, Some(13535));
+    assert_eq!(data.specular_whitelevel, Some(14888));
   }
 }
