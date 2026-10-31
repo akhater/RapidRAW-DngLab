@@ -502,19 +502,22 @@ impl RawImage {
   }
 
   /// Apply blacklevel and whitelevel scaling, replacing raw image data
-  /// with floating point values in range 0.0 .. 1.0.
+  /// with floating point values in range 0.0 .. 1.0, or below 0.0 for a Bayer
+  /// sample below black, which `RawDevelop::develop_intermediate` clips after
+  /// demosaicing.
   /// Internal blacklevel and whitelevel is reset to 0.0 and 1.0 to match image data.
   pub fn apply_scaling(&mut self) -> crate::Result<()> {
     let mut pixels = self.data.as_f32();
     match &self.photometric {
       RawPhotometricInterpretation::BlackIsZero => todo!(),
-      RawPhotometricInterpretation::Cfa(_) => {
+      RawPhotometricInterpretation::Cfa(config) => {
         correct_blacklevel_cfa(
           pixels.to_mut(),
           self.width,
           self.height,
           &self.blacklevel.as_bayer_array(),
           &self.whitelevel.as_bayer_array(),
+          !config.cfa.is_rgb() || config.cfa.is_xtrans(),
         );
         self.data = RawImageData::Float(pixels.into_owned());
       }

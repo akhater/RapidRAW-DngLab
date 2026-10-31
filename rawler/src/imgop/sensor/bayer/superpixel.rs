@@ -3,7 +3,7 @@
 
 use crate::{
   cfa::{PlaneColor, CFA},
-  imgop::{sensor::bayer::RgbBayerPattern, Dim2, Rect},
+  imgop::{raw::clip_negative, sensor::bayer::RgbBayerPattern, Dim2, Rect},
   pixarray::{Color2D, PixF32},
 };
 use rayon::prelude::*;
@@ -56,7 +56,10 @@ impl Demosaic<f32, 3> for Superpixel3Channel {
         r1.chunks_exact(2)
           .zip(r2.chunks_exact(2))
           .map(|(a, b)| {
-            let p = [a[0], a[1], b[0], b[1]];
+            // Each sample clipped at black before green averages two: red and blue are
+            // single samples here, so clipping after would lower green alone and leave a
+            // dark noisy area more magenta (measured on ISO 6400 to 32000 files).
+            let p = clip_negative(&[a[0], a[1], b[0], b[1]]);
             match pattern {
               RgbBayerPattern::RGGB => [p[0], (p[1] + p[2]) / 2.0, p[3]],
               RgbBayerPattern::BGGR => [p[3], (p[1] + p[2]) / 2.0, p[0]],

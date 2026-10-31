@@ -194,6 +194,11 @@ impl CFA {
     self.name.chars().filter(|ch| !['R', 'G', 'B'].contains(ch)).count() == 0 && self.name.contains('R') && self.name.contains('G') && self.name.contains('B')
   }
 
+  /// Check if pattern is a 6x6 X-Trans layout.
+  pub fn is_xtrans(&self) -> bool {
+    self.width == 6 && self.height == 6
+  }
+
   pub fn is_rgbe(&self) -> bool {
     self.name.chars().filter(|ch| !['R', 'G', 'B', 'E'].contains(ch)).count() == 0
       && self.name.contains('R')

@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
   Dim2, Rect, convert_from_f32_scaled_u16,
-  raw::{map_3ch_to_rgb, map_4ch_to_rgb},
+  raw::{clip_negative, map_3ch_to_rgb, map_4ch_to_rgb},
   sensor::bayer::{
     bilinear::Bilinear4Channel, ppg::PPGDemosaic, superpixel::{Superpixel4Channel, SuperpixelQuarterRes3Channel}, Demosaic,
   },
@@ -169,7 +169,7 @@ impl RawDevelop {
             };
             if config.cfa.is_rgb() {
               // Check if this is an X-Trans sensor (6x6 pattern) 
-              if config.cfa.width == 6 && config.cfa.height == 6 {
+              if config.cfa.is_xtrans() {
                 log::info!("X-Trans pattern (6x6) detected. Applying X-Trans demosaicing ({:?}).", self.demosaic_algorithm);
                 match self.demosaic_algorithm {
                   DemosaicAlgorithm::Quality => {
@@ -217,6 +217,16 @@ impl RawDevelop {
         _ => intermediate,
       };
     }
+
+    // Noise below black is clipped here, once, not sample by sample: an interpolated
+    // sample averages its neighbours' noise, so a dark noisy area's mean rises less, and
+    // white balance scales less of that rise into a colour cast. RAWmakase 4d3f6f8c:
+    // crates/rawmakase-decode/src/demosaic.rs. X-Trans still clips each sample first.
+    match &mut intermediate {
+      Intermediate::Monochrome(pixels) => pixels.for_each(|v| v.max(0.0)),
+      Intermediate::ThreeColor(pixels) => pixels.for_each(|p| clip_negative(&p)),
+      Intermediate::FourColor(pixels) => pixels.for_each(|p| clip_negative(&p)),
+    };
 
     if self.steps.contains(&ProcessingStep::Calibrate) {
       let found_matrix = rawimage
@@ -375,5 +385,166 @@ impl RawDevelop {
     tiff.build(root_ifd)?;
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    CFA, RawImageData,
+    cfa::PlaneColor,
+    decoders::Camera,
+    imgop::sensor::bayer::superpixel::Superpixel3Channel,
+    rawimage::{BlackLevel, CFAConfig, WhiteLevel},
+  };
+
+  const BLACK: u16 = 1000;
+  const WHITE: u32 = 16000;
+  const X_TRANS: &str = "RBGBRGGGRGGBGGBGGRBRGRBGGGBGGRGGRGGB";
+
+  /// `samples` as a mosaic of one sample a pixel, its levels `BLACK` and `WHITE`.
+  fn mosaic(pattern: &str, planes: &str, samples: Vec<u16>, width: usize, height: usize) -> RawImage {
+    let cfa = CFA::new(pattern);
+    let colors = PlaneColor::new(planes);
+    RawImage::new_with_data(
+      Camera { cfa: cfa.clone(), plane_color: colors.clone(), ..Default::default() },
+      RawImageData::Integer(samples),
+      width,
+      height,
+      1,
+      [1.0; 4],
+      RawPhotometricInterpretation::Cfa(CFAConfig::new(&cfa, &colors)),
+      Some(BlackLevel::new(&[BLACK], 1, 1, 1)),
+      Some(WhiteLevel::new(vec![WHITE])),
+      false,
+    )
+  }
+
+  /// `level` counts above black, plus and minus `noise` in turn, so that each 4 x 4 block
+  /// holds every colour's samples half above and half below `level`.
+  fn square_noise(width: usize, height: usize, level: u16, noise: u16) -> Vec<u16> {
+    (0..height)
+      .flat_map(|y| (0..width).map(move |x| if (x / 2 + y / 2) % 2 == 0 { BLACK + level + noise } else { BLACK + level - noise }))
+      .collect()
+  }
+
+  /// A repeatable spread of about `noise` around `level` counts above black.
+  fn random_noise(width: usize, height: usize, level: u16, noise: u16) -> Vec<u16> {
+    let mut state = 12345_u32;
+    let mut uniform = move || {
+      state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+      (state >> 16) as f32 / 65536.0
+    };
+    (0..width * height)
+      .map(|_| {
+        let sum: f32 = (0..12).map(|_| uniform()).sum();
+        (BLACK as f32 + level as f32 + (sum - 6.0) * noise as f32) as u16
+      })
+      .collect()
+  }
+
+  fn three_colours(intermediate: Intermediate) -> Vec<[f32; 3]> {
+    match intermediate {
+      Intermediate::ThreeColor(pixels) => pixels.data,
+      _ => panic!("expected three colours a pixel"),
+    }
+  }
+
+  fn demosaiced(raw: &RawImage, demosaic_algorithm: DemosaicAlgorithm) -> Vec<[f32; 3]> {
+    let develop = RawDevelop {
+      steps: vec![ProcessingStep::Rescale, ProcessingStep::Demosaic, ProcessingStep::CropActiveArea],
+      demosaic_algorithm,
+    };
+    three_colours(develop.develop_intermediate(raw).unwrap())
+  }
+
+  fn scaled(raw: &RawImage) -> Vec<f32> {
+    let mut raw = raw.clone();
+    raw.apply_scaling().unwrap();
+    raw.data.as_f32().into_owned()
+  }
+
+  #[test]
+  fn scaling_keeps_a_bayer_sample_below_black_negative() {
+    let raw = mosaic("RGGB", "RGB", [BLACK - 100, BLACK, BLACK + 100, BLACK].repeat(2), 4, 2);
+    let span = (WHITE - BLACK as u32) as f32;
+    assert_eq!(scaled(&raw)[..3], [-100.0 / span, 0.0, 100.0 / span]);
+  }
+
+  #[test]
+  fn scaling_clips_an_x_trans_sample_at_black() {
+    let raw = mosaic(X_TRANS, "RGB", square_noise(12, 12, 0, 100), 12, 12);
+    assert!(scaled(&raw).iter().all(|v| *v >= 0.0));
+  }
+
+  #[test]
+  fn scaling_clips_a_four_colour_sample_at_black() {
+    let raw = mosaic("RGEB", "RGEB", square_noise(8, 8, 0, 100), 8, 8);
+    assert!(scaled(&raw).iter().all(|v| *v >= 0.0));
+  }
+
+  /// Each block's samples average 10 counts above black, so that is what comes
+  /// out, not the 25 they average once each is clipped at black.
+  #[test]
+  fn the_speed_demosaic_averages_samples_below_black_before_clipping() {
+    let raw = mosaic("RGGB", "RGB", square_noise(16, 16, 10, 40), 16, 16);
+    let want = 10.0 / (WHITE - BLACK as u32) as f32;
+    for pixel in demosaiced(&raw, DemosaicAlgorithm::Speed) {
+      for value in pixel {
+        assert!((value - want).abs() < want * 1e-3, "{value} is not {want}");
+      }
+    }
+  }
+
+  /// An area darker than its noise comes out nearer its true level than its
+  /// samples do once each is clipped at black.
+  #[test]
+  fn the_quality_demosaic_interpolates_samples_below_black_before_clipping() {
+    let (width, height, level) = (64, 64, 20);
+    let samples = random_noise(width, height, level, 60);
+    let clipped_first: f32 =
+      samples.iter().map(|&v| v.saturating_sub(BLACK) as f32).sum::<f32>() / samples.len() as f32 / (WHITE - BLACK as u32) as f32;
+    let raw = mosaic("RGGB", "RGB", samples, width, height);
+    let out = demosaiced(&raw, DemosaicAlgorithm::Quality);
+    let mean: f32 = out.iter().flatten().sum::<f32>() / (out.len() * 3) as f32;
+    assert!(mean < clipped_first * 0.95, "mean {mean}, clipped first {clipped_first}");
+  }
+
+  #[test]
+  fn nothing_below_black_reaches_white_balance() {
+    let raw = mosaic("RGGB", "RGB", random_noise(64, 64, 20, 60), 64, 64);
+    for algorithm in [DemosaicAlgorithm::Quality, DemosaicAlgorithm::Speed] {
+      assert!(demosaiced(&raw, algorithm).iter().flatten().all(|v| *v >= 0.0));
+    }
+  }
+
+  /// Red and blue are single samples at this size and green averages two, so clipping
+  /// after averaging would lower green alone and leave a dark area more magenta.
+  #[test]
+  fn the_half_size_superpixel_clips_each_sample_first() {
+    let cfa = CFA::new("RGGB");
+    let pixels = PixF32::new_with(vec![-0.25, -0.5, 0.75, 0.25], 2, 2);
+    let half = Superpixel3Channel::new().demosaic(&pixels, &cfa, &PlaneColor::new("RGB"), pixels.rect());
+    assert_eq!(half.data, [[0.0, 0.375, 0.25]]);
+  }
+
+  /// A picture demosaiced elsewhere, as a half-size develop's is, is clipped the same way.
+  #[test]
+  fn three_colours_from_elsewhere_are_clipped_before_white_balance() {
+    let raw = RawImage::new_with_data(
+      Camera::default(),
+      RawImageData::Float(vec![-0.25, 0.5, 0.75, 0.25, -0.5, 0.0]),
+      6,
+      1,
+      3,
+      [1.0; 4],
+      RawPhotometricInterpretation::LinearRaw,
+      None,
+      Some(WhiteLevel::new(vec![1, 1, 1])),
+      false,
+    );
+    let develop = RawDevelop { steps: vec![ProcessingStep::WhiteBalance], ..Default::default() };
+    assert_eq!(three_colours(develop.develop_intermediate(&raw).unwrap()), [[0.0, 0.5, 0.75], [0.25, 0.0, 0.0]]);
   }
 }

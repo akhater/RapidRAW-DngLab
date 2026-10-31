@@ -144,12 +144,13 @@ pub fn correct_blacklevel(raw: &mut [f32], blacklevel: &[f32], whitelevel: &[f32
 
 /// Correct data by blacklevel and whitelevel on CFA (bayer) data.
 ///
-/// The output is between 0.0 .. 1.0.
+/// White is 1.0. A sample below black is 0.0 with `clip_black`, and negative
+/// without it, for a demosaic that averages the noise there before it is clipped.
 ///
 /// This version is optimized vor vectorization, so please check
 /// modifications on godbolt before committing.
 #[multiversion(targets("x86_64+avx+avx2", "x86+sse", "aarch64+neon"))]
-pub fn correct_blacklevel_cfa(raw: &mut [f32], width: usize, _height: usize, blacklevel: &[f32; 4], whitelevel: &[f32; 4]) {
+pub fn correct_blacklevel_cfa(raw: &mut [f32], width: usize, _height: usize, blacklevel: &[f32; 4], whitelevel: &[f32; 4], clip_black: bool) {
   //assert_eq!(width % 2, 0, "width is {}", width);
   //assert_eq!(height % 2, 0, "height is {}", height);
   // max value can be pre-computed for all channels.
@@ -160,7 +161,7 @@ pub fn correct_blacklevel_cfa(raw: &mut [f32], width: usize, _height: usize, bla
     whitelevel[3] - blacklevel[3],
   ];
   let clip = |v: f32| {
-    if v.is_sign_negative() { 0.0 } else { v }
+    if clip_black && v.is_sign_negative() { 0.0 } else { v }
   };
   // Process two bayer lines at once.
   raw.par_chunks_exact_mut(width * 2).for_each(|lines| {
