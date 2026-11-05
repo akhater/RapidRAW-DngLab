@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::cfa::PlaneColor;
-use crate::imgop::raw::{correct_blacklevel, correct_blacklevel_cfa};
+use crate::imgop::raw::{correct_blacklevel_cfa, correct_blacklevel_pattern};
 use crate::imgop::{convert_from_f32_scaled_u16, convert_to_f32_unscaled};
 use crate::pixarray::SubPixel;
 use crate::{
@@ -522,7 +522,7 @@ impl RawImage {
         self.data = RawImageData::Float(pixels.into_owned());
       }
       RawPhotometricInterpretation::LinearRaw => {
-        correct_blacklevel(pixels.to_mut(), &self.blacklevel.as_vec(), &self.whitelevel.as_vec());
+        correct_blacklevel_pattern(pixels.to_mut(), self.width, self.cpp, &self.blacklevel, &self.whitelevel)?;
         self.data = RawImageData::Float(pixels.into_owned());
       }
     }

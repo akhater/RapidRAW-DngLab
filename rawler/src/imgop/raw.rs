@@ -99,47 +99,61 @@ fn correct_blacklevel_channels<const CH: usize>(raw: &mut [f32], blacklevel: &[f
   }
 }
 
-/// Correct data by blacklevel and whitelevel on CFA (bayer) data.
+/// Correct pixel data with `cpp` samples per pixel by a black level pattern
+/// and the white level.
 ///
-/// The output is between 0.0 .. 1.0.
+/// The black level pattern is `black.width` x `black.height` pixels (DNG
+/// BlackLevelRepeatDim), repeated from the top-left pixel, with a value for
+/// each sample or one for all samples. A white level has a value for each
+/// sample or one for all. 1.0 is the white level minus the highest black
+/// level of the sample, values below black are 0.0.
 ///
-/// This version is optimized vor vectorization, so please check
-/// modifications on godbolt before committing.
-#[multiversion(targets("x86_64+avx+avx2", "x86+sse", "aarch64+neon"))]
-pub fn correct_blacklevel(raw: &mut [f32], blacklevel: &[f32], whitelevel: &[f32]) {
-  match (blacklevel.len(), whitelevel.len()) {
-    (1, 1) => correct_blacklevel_channels::<1>(
-      raw,
-      blacklevel.try_into().expect("Array size mismatch"),
-      whitelevel.try_into().expect("Array size mismatch"),
-    ),
-    (3, 3) => correct_blacklevel_channels::<3>(
-      raw,
-      blacklevel.try_into().expect("Array size mismatch"),
-      whitelevel.try_into().expect("Array size mismatch"),
-    ),
-    (a, b) if a == b => {
-      // max value can be pre-computed for all channels.
-      let mut max = whitelevel.to_vec();
-      max.iter_mut().enumerate().for_each(|(i, x)| *x -= blacklevel[i]);
-
-      let clip = |v: f32| {
-        if v.is_sign_negative() { 0.0 } else { v }
-      };
-
-      let ch = blacklevel.len();
-      raw.chunks_exact_mut(ch).for_each(|block| {
-        for i in 0..ch {
-          block[i] = clip(block[i] - blacklevel[i]) / max[i];
-        }
-      });
-    }
-    _ => log::warn!(
-      "Blacklevel ({}) and Whitelevel ({}) count mismatch, skipping correction",
-      blacklevel.len(),
-      whitelevel.len()
-    ),
+/// Adapted from dnglab's `RescaleRows` and `BlackLevel::max_level`
+/// (rawler/src/imgop/blacklevel.rs @ 0f645aa6ed, "Map raw values to linear
+/// values by the DNG black level model"), without the BlackLevelDeltaH/V
+/// differences this fork does not read.
+pub fn correct_blacklevel_pattern(raw: &mut [f32], width: usize, cpp: usize, black: &BlackLevel, white: &WhiteLevel) -> Result<(), String> {
+  if black.cpp != cpp && black.cpp != 1 {
+    return Err(format!("Black level has {} samples per pixel, image has {}", black.cpp, cpp));
   }
+  if white.0.len() != cpp && white.0.len() != 1 {
+    return Err(format!("White level has {} values, image has {} samples per pixel", white.0.len(), cpp));
+  }
+  if black.levels.len() != black.sample_count() || black.levels.is_empty() || width == 0 || cpp == 0 {
+    return Err(format!(
+      "Black level pattern has {} values, expected {}",
+      black.levels.len(),
+      black.sample_count()
+    ));
+  }
+  let level = |row: usize, col: usize, sample: usize| {
+    black.levels[((row % black.height) * black.width + col % black.width) * black.cpp + sample.min(black.cpp - 1)].as_f32()
+  };
+  // The linear value 1.0 is the white level minus the maximum black level of each sample
+  let range: Vec<f32> = (0..cpp)
+    .map(|sample| {
+      let max_black = (0..black.height)
+        .flat_map(|row| (0..black.width).map(move |col| (row, col)))
+        .map(|(row, col)| level(row, col, sample))
+        .fold(f32::NEG_INFINITY, f32::max);
+      white.0[sample.min(white.0.len() - 1)] as f32 - max_black
+    })
+    .collect();
+  if let Some(range) = range.iter().find(|range| !range.is_finite() || **range <= 0.0) {
+    return Err(format!("White level must be above the maximum black level, the difference is {}", range));
+  }
+  // One row of black levels for each row of the pattern, the width of the image
+  let row_len = width * cpp;
+  let black_rows: Vec<Vec<f32>> = (0..black.height)
+    .map(|row| (0..row_len).map(|i| level(row, i / cpp, i % cpp)).collect())
+    .collect();
+  let scale: Vec<f32> = (0..row_len).map(|i| 1.0 / range[i % cpp]).collect();
+  raw.par_chunks_mut(row_len).enumerate().for_each(|(row, samples)| {
+    for ((v, black), scale) in samples.iter_mut().zip(&black_rows[row % black.height]).zip(&scale) {
+      *v = (*v - black).max(0.0) * scale;
+    }
+  });
+  Ok(())
 }
 
 /// Correct data by blacklevel and whitelevel on CFA (bayer) data.
@@ -263,5 +277,53 @@ pub fn rotate_90(src: &[u16], dst: &mut [u16], width: usize, height: usize) {
       let ocol = (owidth - 1) - row; // inverse
       dst[orow * owidth + ocol] = *pix;
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// LinearRaw with a 2x2 black level pattern of three samples (12 values, as
+  /// in phone DNGs with BlackLevelRepeatDim 2x2) and one white level per sample
+  #[test]
+  fn black_level_pattern_with_white_level_per_sample() -> Result<(), String> {
+    let black = BlackLevel::new(&[10_u16, 20, 30, 11, 21, 31, 12, 22, 32, 13, 23, 33], 2, 2, 3);
+    let white = WhiteLevel::new(vec![1013_u32, 2023, 4033]);
+    // 3x2 pixels: the pattern repeats from the top-left pixel
+    let (width, cpp) = (3, 3);
+    let mut raw: Vec<f32> = vec![
+      10.0, 20.0, 30.0, 511.0, 1021.0, 2031.0, 1010.0, 2020.0, 4030.0, //
+      12.0, 22.0, 0.0, 1013.0, 2023.0, 4033.0, 512.0, 1022.0, 2032.0,
+    ];
+    correct_blacklevel_pattern(&mut raw, width, cpp, &black, &white)?;
+    // 1.0 is the white level minus the highest black level of the sample: 1000, 2000, 4000
+    let expected = [
+      0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, //
+      0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5,
+    ];
+    for (v, e) in raw.iter().zip(expected) {
+      assert!((v - e).abs() < 1e-6, "{:?} != {:?}", raw, expected);
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn black_level_pattern_with_one_value() -> Result<(), String> {
+    let mut raw = vec![16383.0_f32, 4279.0, 0.0];
+    correct_blacklevel_pattern(&mut raw, 1, 3, &BlackLevel::new(&[0_u16], 1, 1, 1), &WhiteLevel::new(vec![16383_u32]))?;
+    assert_eq!(raw, vec![1.0, 4279.0 / 16383.0, 0.0]);
+    Ok(())
+  }
+
+  #[test]
+  fn black_level_pattern_rejects_levels_that_do_not_fit() {
+    let mut raw = vec![0.0_f32; 6];
+    let black = BlackLevel::new(&[0_u16, 0], 1, 1, 2);
+    assert!(correct_blacklevel_pattern(&mut raw, 2, 3, &black, &WhiteLevel::new(vec![100_u32])).is_err());
+    let black = BlackLevel::new(&[0_u16], 1, 1, 1);
+    assert!(correct_blacklevel_pattern(&mut raw, 2, 3, &black, &WhiteLevel::new(vec![100_u32, 100])).is_err());
+    let black = BlackLevel::new(&[100_u16], 1, 1, 1);
+    assert!(correct_blacklevel_pattern(&mut raw, 2, 3, &black, &WhiteLevel::new(vec![100_u32])).is_err());
   }
 }
